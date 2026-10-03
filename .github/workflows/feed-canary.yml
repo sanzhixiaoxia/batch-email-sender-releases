@@ -136,15 +136,31 @@ jobs:
 
             # ④ 安装包本体 + blockmap
             if [ -n "$FILE" ]; then
-              # 只要 1 字节： Range 支持则 206，全量返回则 200（差量/续传退化），取不到则是硬坏
-              code=$(probe 206 "${B}/download/${TAG}/${FILE}" "$OUT/first-byte" -r 0-0)
+              # 只要 1 字节：Range 支持则 206，全量返回则 200（差量/续传退化），取不到则是硬坏。
+              # 顺手从 Content-Range 读出真实总长度，和 latest.yml 的 size 对一次——
+              # 这是客户端下载完成后的校验口径（sha512 要下满 134 MB，这里不做；
+              # 但长度对不上意味着包被换过或截断，客户端必然 ERR_UPDATER_ 校验失败）。
+              HDR=$(mktemp)
+              code=$(curl -sSL -D "$HDR" -o "$OUT/first-byte" -w '%{http_code}' --max-time 120 \
+                -r 0-0 "${B}/download/${TAG}/${FILE}" 2>/dev/null) || code="000"
+              total=$(grep -i '^content-range:' "$HDR" | sed 's#.*/##' | tr -d ' \r\n')
               if [ "$code" = "206" ]; then
                 record ok "安装包 Range" "HTTP 206，${FILE} 可分段取（只取了 $(wc -c < "$OUT/first-byte" | tr -d ' ') 字节）"
               elif [ "$code" = "200" ]; then
                 record warn "安装包 Range" "HTTP 200 而非 206：托管端不回 Range，退化为整包下载（能用，但慢且不能续传）"
+                total=$(grep -i '^content-length:' "$HDR" | sed 's/^[^:]*://' | tr -d ' \r\n')
               else
                 record fail "安装包 Range" "匿名 HTTP ${code}（期望 206）——${FILE} 取不到，用户点更新会卡在下载"
+                total=""
               fi
+              if [ -n "${FSIZE:-}" ] && [ -n "$total" ]; then
+                if [ "$FSIZE" = "$total" ]; then
+                  record ok "安装包长度 ↔ latest.yml" "两侧都是 ${FSIZE} 字节"
+                else
+                  record fail "安装包长度 ↔ latest.yml" "latest.yml 写 ${FSIZE} 而实际包 ${total} 字节：客户端按 sha512/size 校验必然失败，更新装不上"
+                fi
+              fi
+
               bcode=$(probe 200 "${B}/download/${TAG}/${FILE}.blockmap" "$OUT/blockmap")
               if [ "$bcode" = "200" ]; then
                 record ok "blockmap" "HTTP 200，差量更新可用"
