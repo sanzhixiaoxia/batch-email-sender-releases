@@ -1,0 +1,179 @@
+name: Feed Canary — 匿名校验应用内更新链路
+
+# 这个工作流不属于打包链，它是**线上监控**：每天两次，完全匿名（不带任何凭据）
+# 走一遍桌面客户端「检查更新」实际会走的每一跳。
+#
+# 为什么要有它：私有源码仓库里的构建期断言（check-update-feed.mjs、release.yml 的产物侧
+# app-update.yml 校验）只在发版那一刻有效。而这条链路最容易坏在「发版之后、无人改动代码」时：
+#   ① 本仓库被误设为 private → 匿名请求一律 404，客户端从此查不到新版；
+#   ② 某个版本的 Release 或 latest.yml 资源被删 → 客户端 404（ERR_UPDATER_CHANNEL_FILE_NOT_FOUND）；
+#   ③ tag 与 latest.yml 里的 version 不一致 → 客户端反复提示同一版本或校验不上；
+#   ④ 安装包不再支持 Range / 换了托管域 → 差量与断点续传退化，下载变慢甚至失败。
+# 这四种坏法在源码侧全绿，只有真实用户点「检查更新」时才暴露。本工作流把「等用户报障」
+# 变成「Actions 页面先红」。
+#
+# 口径来自 electron-updater@6.8.9 的 GitHubProvider.getLatestVersion()：
+#   GET https://github.com/<owner>/<repo>/releases.atom      （取条目与说明）
+#   GET https://github.com/<owner>/<repo>/releases/latest    （定 tag；GitHub 走 web 而非 API，避开限流）
+#   GET https://github.com/<owner>/<repo>/releases/download/<tag>/latest.yml
+#   GET <files[0].url>（安装包，带 Range 分片下载）
+# 前两个地址本身都是 302，必须跟随后再看状态码——不跟随会把「公开可读」误判成失败。
+#
+# 失败表现：run 变红 + 汇总里逐条列出问题；GitHub 默认就失败的 run 通知仓库 owner。
+# 刻意不自动开 issue：本仓库公开，issue 对所有人可见，坏一条更新链不值得公开广播。
+#
+# 本仓库是公开仓库：Actions 分钟数不计量，也不占私有源码仓库的额度。
+
+on:
+  schedule:
+    - cron: '17 3,15 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: feed-canary
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: 匿名探测更新源
+    runs-on: ubuntu-latest
+    steps:
+      - name: 逐跳探测（与客户端同一口径）
+        shell: bash
+        env:
+          OWNER: sanzhixiaoxia
+          REPO: batch-email-sender-releases
+        run: |
+          # 刻意不开 -e：探测脚本要跑完全部检查项再汇总退出，中途因某条命令非零退出
+          # 只会丢掉后面的检查项，让汇总看起来像「只有这一处坏」。
+          set -uo pipefail
+
+          B="https://github.com/${OWNER}/${REPO}/releases"
+          OUT=$(mktemp -d)
+          fails=()
+          warns=()
+          rows=()
+
+          record() { # record <ok|fail|warn> <检查项> <详情>
+            local level="$1" step="$2" detail="$3"
+            rows+=("| ${level} | ${step} | ${detail} |")
+            case "$level" in
+              fail) fails+=("${step}：${detail}");;
+              warn) warns+=("${step}：${detail}");;
+            esac
+          }
+
+          # probe <expect> <url> <save-to> [extra curl args...] → 打印最终状态码
+          # 重试只针对「非预期码」，且跳过语义性状态码（401/403/404/451 重试也不会变好）：
+          # GitHub 偶发 5xx 与 runner 出口抖动不该被记成链路坏掉。
+          probe() {
+            local expect="$1" url="$2" save="$3"; shift 3
+            local attempt code
+            for attempt in 1 2 3; do
+              code=$(curl -sSL -o "$save" -w '%{http_code}' --max-time 120 "$@" "$url" 2>/dev/null) || code="000"
+              if [ "$code" = "$expect" ]; then printf '%s' "$code"; return 0; fi
+              case "$code" in 401|403|404|451) break;; esac
+              [ "$attempt" -lt 3 ] && sleep 5
+            done
+            printf '%s' "$code"
+            return 1
+          }
+
+          # ① atom 订阅源
+          code=$(probe 200 "${B}.atom" "$OUT/feed.xml" -H 'accept: application/atom+xml')
+          if [ "$code" = "200" ]; then
+            n=$(grep -o '/tag/v[0-9][^<"]*' "$OUT/feed.xml" | sed 's#.*/tag/##' | sort -u | wc -l | tr -d ' ')
+            first=$(grep -o '/tag/v[0-9][^<"]*' "$OUT/feed.xml" | head -1 | sed 's#.*/tag/##')
+            if [ "${n:-0}" -ge 1 ]; then
+              record ok "atom 订阅源" "HTTP 200，版本条目 ${n} 个，首条 ${first}"
+            else
+              record fail "atom 订阅源" "HTTP ${code} 但解析不出 /tag/ 引用，客户端会报 ERR_UPDATER_NO_PUBLISHED_VERSIONS"
+            fi
+          else
+            record fail "atom 订阅源" "匿名 HTTP ${code}（期望 200）——仓库被设成私有了，还是 Release 全被删了？"
+          fi
+
+          # ② releases/latest → 定 tag（客户端用网页地址而非 API，就是为了避开匿名限流 403/429）
+          code=$(probe 200 "${B}/latest" "$OUT/latest.html" -H 'Accept: application/json')
+          eff=$(curl -sSL -o /dev/null -w '%{url_effective}' --max-time 120 "${B}/latest" 2>/dev/null)
+          TAG=$(printf '%s' "$eff" | sed -n 's#.*/tag/##p')
+          if [ "$code" = "200" ] && [ -n "$TAG" ]; then
+            record ok "latest → tag" "HTTP 200，当前最新版本 ${TAG}"
+          else
+            record fail "latest → tag" "HTTP ${code}，跟随后落地 ${eff:-未知}；客户端定不到 tag 就取不到 latest.yml"
+          fi
+
+          FILE=""; YVER=""
+          if [ -n "$TAG" ]; then
+            # ③ latest.yml：更新完整性的唯一凭据（更新侧签名校验已关，客户端只认 sha512 + size）
+            code=$(probe 200 "${B}/download/${TAG}/latest.yml" "$OUT/latest.yml")
+            if [ "$code" = "200" ]; then
+              YVER=$(sed -n 's/^version:[[:space:]]*//p' "$OUT/latest.yml" | head -1)
+              FILE=$(sed -n 's#^[[:space:]]*-[[:space:]]*url:[[:space:]]*##p' "$OUT/latest.yml" | head -1)
+              FSIZE=$(sed -n 's/^[[:space:]]*size:[[:space:]]*//p' "$OUT/latest.yml" | head -1)
+              SHA=$(sed -n 's/^[[:space:]]*sha512:[[:space:]]*//p' "$OUT/latest.yml" | head -1)
+              missing=""
+              [ -n "$YVER" ] || missing+="version "
+              [ -n "$FILE" ] || missing+="files[0].url "
+              [ -n "$FSIZE" ] || missing+="size "
+              [ -n "$SHA" ] || missing+="sha512 "
+              if [ -n "$missing" ]; then
+                record fail "latest.yml 字段" "缺字段：${missing}——客户端无从校验或下载"
+              else
+                record ok "latest.yml" "HTTP 200，version=${YVER} file=${FILE} size=${FSIZE}"
+                if [ "v${YVER}" = "$TAG" ]; then
+                  record ok "tag ↔ version" "${TAG} ↔ ${YVER} 一致"
+                else
+                  record fail "tag ↔ version" "tag=${TAG} 而 latest.yml version=${YVER}：客户端会反复提示同一版本"
+                fi
+              fi
+            else
+              record fail "latest.yml" "匿名 HTTP ${code}（期望 200）——${TAG} 的 Release 里没有 latest.yml 或已被删"
+            fi
+
+            # ④ 安装包本体 + blockmap
+            if [ -n "$FILE" ]; then
+              # 只要 1 字节： Range 支持则 206，全量返回则 200（差量/续传退化），取不到则是硬坏
+              code=$(probe 206 "${B}/download/${TAG}/${FILE}" "$OUT/first-byte" -r 0-0)
+              if [ "$code" = "206" ]; then
+                record ok "安装包 Range" "HTTP 206，${FILE} 可分段取（只取了 $(wc -c < "$OUT/first-byte" | tr -d ' ') 字节）"
+              elif [ "$code" = "200" ]; then
+                record warn "安装包 Range" "HTTP 200 而非 206：托管端不回 Range，退化为整包下载（能用，但慢且不能续传）"
+              else
+                record fail "安装包 Range" "匿名 HTTP ${code}（期望 206）——${FILE} 取不到，用户点更新会卡在下载"
+              fi
+              bcode=$(probe 200 "${B}/download/${TAG}/${FILE}.blockmap" "$OUT/blockmap")
+              if [ "$bcode" = "200" ]; then
+                record ok "blockmap" "HTTP 200，差量更新可用"
+              else
+                record warn "blockmap" "匿名 HTTP ${bcode}：差量更新将退化为整包下载"
+              fi
+            fi
+          fi
+
+          # 汇总
+          {
+            echo "## 更新源自检（匿名口径，不带任何凭据）"
+            echo
+            echo "| 结果 | 检查项 | 详情 |"
+            echo "| --- | --- | --- |"
+            printf '%s\n' "${rows[@]}"
+            echo
+            echo "- 探测时刻（UTC）：$(date -u +'%F %T')"
+            echo "- 目标：\`${OWNER}/${REPO}\`，当前版本 \`${TAG:-未解析}\` / latest.yml version \`${YVER:-未解析}\`"
+            echo "- 客户端口径来源：\`electron-updater\` 的 GitHubProvider（\`.atom\` → \`releases/latest\` → \`download/<tag>/latest.yml\` → 安装包）"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ ${#warns[@]} -gt 0 ]; then
+            printf '⚠️ %s\n' "${warns[@]}"
+          fi
+          if [ ${#fails[@]} -gt 0 ]; then
+            printf '::error::更新链路自检失败 %d 项\n' "${#fails[@]}"
+            printf '❌ %s\n' "${fails[@]}"
+            echo "→ 先确认仓库可见性仍是 public，再确认该版本 Release 与 latest.yml 资源是否还在。"
+            exit 1
+          fi
+          echo "✅ 更新链路全绿：客户端可匿名完成「查新版 → 取 latest.yml → 下载安装包」"
