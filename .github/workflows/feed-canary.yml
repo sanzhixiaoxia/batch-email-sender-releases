@@ -60,6 +60,8 @@ jobs:
           record() { # record <ok|fail|warn> <检查项> <详情>
             local level="$1" step="$2" detail="$3"
             rows+=("| ${level} | ${step} | ${detail} |")
+            # 同时打进日志：汇总表格在 UI 里才看得到，日志留一份才能事后从 Actions 原始日志对账
+            echo "[${level}] ${step} — ${detail}"
             case "$level" in
               fail) fails+=("${step}：${detail}");;
               warn) warns+=("${step}：${detail}");;
