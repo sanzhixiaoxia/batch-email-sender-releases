@@ -138,19 +138,33 @@ jobs:
 
             # ④ 安装包本体 + blockmap
             if [ -n "$FILE" ]; then
-              # 只要 1 字节：Range 支持则 206，全量返回则 200（差量/续传退化），取不到则是硬坏。
-              # 顺手从 Content-Range 读出真实总长度，和 latest.yml 的 size 对一次——
-              # 这是客户端下载完成后的校验口径（sha512 要下满 134 MB，这里不做；
-              # 但长度对不上意味着包被换过或截断，客户端必然 ERR_UPDATER_ 校验失败）。
+              # 探测口径：HEAD + Range，只看响应头不下载实体。
+              # 用 GET 要冒真下 134 MB 的风险——托管端若忽略 Range 会直接回 200 全量，
+              # 每天两次的定时任务能把 runner 带宽和分钟数白烧掉（公开仓库不计费，但没必要）。
+              # 响应里读两件事：① Range 是否被支持（206 = 差量/续传可用）
+              # ② Content-Range 的总长度，与 latest.yml 的 size 对一次——
+              #   长度对不上说明包被换过或截断，客户端下载完按 sha512/size 校验必然失败。
+              #   （sha512 本身要下满整包才能算，这里刻意不做；size 已能挡住绝大多数错位。）
               HDR=$(mktemp)
-              code=$(curl -sSL -D "$HDR" -o "$OUT/first-byte" -w '%{http_code}' --max-time 120 \
+              code=$(curl -sSIL -D "$HDR" -o /dev/null -w '%{http_code}' --max-time 120 \
                 -r 0-0 "${B}/download/${TAG}/${FILE}" 2>/dev/null) || code="000"
-              total=$(grep -i '^content-range:' "$HDR" | sed 's#.*/##' | tr -d ' \r\n')
+              # -D 落盘的是整条重定向链的响应头（302 那一跳的状态行里也有 “/”），
+              # 所以必须锚定字段名取纯数字，不能简单 sed 's#.*/##'——那会把 "HTTP/2 206" 读成 2206。
+              total=$(sed -n 's/^[Cc]ontent-[Rr]ange:[[:space:]]*bytes[[:space:]]*[0-9]*-[0-9]*\/\([0-9]\{1,\}\).*/\1/p' "$HDR" | head -1)
+              if [ "$code" = "405" ] || [ "$code" = "501" ]; then
+                # 极少数托管端不支持 HEAD：退回 GET，但仍用 --max-filesize 把实体卡住，
+                # 响应头里的长度一旦超过它就中断，不会整包下载。
+                HDR2=$(mktemp)
+                code=$(curl -sSL -D "$HDR2" -o "$OUT/first-byte" -w '%{http_code}' --max-time 120 \
+                  --max-filesize "$(( ${FSIZE:-1} + 1 ))" -r 0-0 "${B}/download/${TAG}/${FILE}" 2>/dev/null) || code="000"
+                HDR="$HDR2"
+                total=$(sed -n 's/^[Cc]ontent-[Rr]ange:[[:space:]]*bytes[[:space:]]*[0-9]*-[0-9]*\/\([0-9]\{1,\}\).*/\1/p' "$HDR" | head -1)
+              fi
               if [ "$code" = "206" ]; then
-                record ok "安装包 Range" "HTTP 206，${FILE} 可分段取（只取了 $(wc -c < "$OUT/first-byte" | tr -d ' ') 字节）"
+                record ok "安装包 Range" "HTTP 206（HEAD 探测，未下载实体），${FILE} 可分段取"
               elif [ "$code" = "200" ]; then
                 record warn "安装包 Range" "HTTP 200 而非 206：托管端不回 Range，退化为整包下载（能用，但慢且不能续传）"
-                total=$(grep -i '^content-length:' "$HDR" | sed 's/^[^:]*://' | tr -d ' \r\n')
+                total=$(sed -n 's/^[Cc]ontent-[Ll]ength:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' "$HDR" | tail -1)
               else
                 record fail "安装包 Range" "匿名 HTTP ${code}（期望 206）——${FILE} 取不到，用户点更新会卡在下载"
                 total=""
